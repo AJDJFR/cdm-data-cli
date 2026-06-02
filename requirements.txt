@@ -1,0 +1,15 @@
+# Medical CLI - Core dependencies
+click>=8.0.0
+pydantic>=2.0.0
+
+# Optional dependencies for specific features
+lxml>=4.9.0          # XML processing support
+openpyxl>=3.0.0      # Excel export support
+
+# Development dependencies
+pytest>=7.0.0        # Testing framework
+pytest-cov>=4.0.0    # Coverage reporting
+black>=23.0.0        # Code formatting
+isort>=5.0.0         # Import sorting
+mypy>=1.0.0          # Type checking
+ruff>=0.1.0          # Linting
