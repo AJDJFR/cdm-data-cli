@@ -1,18 +1,18 @@
 """EDC Wide-Table Adapter for complex clinical data exports.
 
-This module provides an adapter that can parse EDC (Electronic Data Capture)
+This module provides an intelligent adapter that can parse EDC (Electronic Data Capture)
 system exports with complex multi-row headers and wide-table structure.
 
-The adapter handles:
-- Multi-row metadata headers (rows 1-7 contain system info)
-- Chinese column names for clinical variables
-- Wide-table format with multiple lab values per subject row
-- Conversion to standard lab_values format for validation
+Key Features:
+- Heuristic dynamic header detection (no hardcoded row indices)
+- Fuzzy column name matching using semantic patterns
+- Wide-to-long transformation for clinical data validation
 """
 
-from datetime import datetime
+import re
+from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -22,57 +22,61 @@ from medical_cli.utils.logger import get_logger
 logger = get_logger("medical_cli.core.adapters.edc_wide_adapter")
 
 
-# Mapping from Chinese clinical variable names to standard Test_Codes
-CHINESE_TO_TEST_CODE_MAPPING: Dict[str, str] = {
-    # Blood routine tests
-    "血常规_白细胞": "WBC",
-    "血常规_红细胞": "RBC",
-    "血常规_血红蛋白": "HGB",
-    "血常规_血小板": "PLT",
-    "血常规_中性粒细胞": "NEUT",
-    "血常规_淋巴细胞": "LYMPH",
-    "血常规_单核细胞": "MONO",
-    "血常规_嗜酸性粒细胞": "EOS",
-    "血常规_嗜碱性粒细胞": "BASO",
-    
-    # Liver function tests
-    "肝功能_谷丙转氨酶": "ALT",
-    "肝功能_谷草转氨酶": "AST",
-    "肝功能_总胆红素": "TBIL",
-    "肝功能_直接胆红素": "DBIL",
-    "肝功能_白蛋白": "ALB",
-    "肝功能_总蛋白": "TP",
-    "肝功能_碱性磷酸酶": "ALP",
-    "肝功能_谷氨酰转肽酶": "GGT",
-    
-    # Renal function tests
-    "肾功能_血清钾": "K",
-    "肾功能_血清钠": "NA",
-    "肾功能_血清氯": "CL",
-    "肾功能_血清肌酐": "CRE",
-    "肾功能_尿素氮": "BUN",
-    "肾功能_尿酸": "UA",
-    
-    # Blood glucose tests
-    "血糖_空腹血糖": "GLU",
-    "血糖_餐后2h血糖": "GLU_2H",
-    
-    # Lipid tests
-    "血脂_总胆固醇": "TC",
-    "血脂_甘油三酯": "TG",
-    "血脂_高密度脂蛋白": "HDL",
-    "血脂_低密度脂蛋白": "LDL",
-    
-    # Cardiac markers
-    "心肌标志物_肌酸激酶": "CK",
-    "心肌标志物_肌钙蛋白": "TNI",
-    "心肌标志物_B型钠尿肽": "BNP",
-    
-    # Coagulation tests
-    "凝血功能_凝血酶原时间": "PT",
-    "凝血功能_活化部分凝血活酶时间": "APTT",
-    "凝血功能_凝血酶时间": "TT",
-    "凝血功能_纤维蛋白原": "FIB",
+# Clinical core keyword vocabulary for header detection
+CLINICAL_CORE_VOCABULARY: Set[str] = {
+    # Chinese keywords
+    "中心", "编号", "受试者", "日期", "检查", "姓名", "性别", "年龄",
+    "白细胞", "红细胞", "血红蛋白", "血小板", "中性粒", "淋巴",
+    "谷丙", "谷草", "转氨酶", "胆红素", "白蛋白", "肌酐", "尿素",
+    "尿酸", "血糖", "血脂", "胆固醇", "甘油三酯",
+    "钾", "钠", "氯", "肝功能", "肾功能", "血常规",
+    # English keywords
+    "WBC", "RBC", "HGB", "PLT", "ALT", "AST", "K", "NA", "CRE", "BUN",
+    "Subject", "Patient", "Date", "Visit", "Age", "Sex", "Gender",
+    "ID", "Lab", "Test", "Result", "Value", "Unit", "Normal", "Range",
+}
+
+# Metadata keywords that indicate non-data rows
+METADATA_KEYWORDS: Set[str] = {
+    "变量", "Variable", "变量ID", "VariableID", "类型", "Type",
+    "必答", "Required", "必填", "必选", "格式", "Format", "长度", "Length",
+    "选项", "Options", "范围", "Range", "默认值", "Default",
+    "DataType", "Label", "Section", "Form", "CRF",
+}
+
+# Test code keywords for column classification
+TEST_CODE_KEYWORDS: Dict[str, List[str]] = {
+    "WBC": ["白细胞", "WBC", " leukocyte", "white blood"],
+    "RBC": ["红细胞", "RBC", " erythrocyte", "red blood"],
+    "HGB": ["血红蛋白", "HGB", "HB", "hemoglobin"],
+    "PLT": ["血小板", "PLT", "thrombocyte", "platelet"],
+    "NEUT": ["中性粒", "NEUT", "neutrophil"],
+    "LYMPH": ["淋巴", "LYMPH", "lymphocyte"],
+    "MONO": ["单核", "MONO", "monocyte"],
+    "EOS": ["嗜酸", "EOS", "eosinophil"],
+    "BASO": ["嗜碱", "BASO", "basophil"],
+    "ALT": ["谷丙", "ALT", "GPT", "alanine"],
+    "AST": ["谷草", "AST", "GOT", "aspartate"],
+    "TBIL": ["总胆红素", "TBIL", "bilirubin"],
+    "DBIL": ["直接胆红素", "DBIL"],
+    "ALB": ["白蛋白", "ALB", "albumin"],
+    "TP": ["总蛋白", "TP", "total protein"],
+    "ALP": ["碱性磷酸酶", "ALP", "phosphatase"],
+    "GGT": ["谷氨酰", "GGT", "transpeptidase"],
+    "K": ["血清钾", "血钾", "K", "potassium"],
+    "NA": ["血清钠", "血钠", "NA", "sodium"],
+    "CL": ["血清氯", "血氯", "CL", "chloride"],
+    "CRE": ["肌酐", "CRE", "creatinine"],
+    "BUN": ["尿素氮", "BUN", "urea"],
+    "UA": ["尿酸", "UA", "uric acid"],
+    "GLU": ["血糖", "GLU", "glucose"],
+    "TC": ["总胆固醇", "TC", "cholesterol"],
+    "TG": ["甘油三酯", "TG", "triglyceride"],
+    "HDL": ["高密度脂蛋白", "HDL"],
+    "LDL": ["低密度脂蛋白", "LDL"],
+    "CK": ["肌酸激酶", "CK", "CPK", "creatine kinase"],
+    "TNI": ["肌钙蛋白", "TNI", "troponin"],
+    "BNP": ["B型钠尿肽", "BNP", "natriuretic"],
 }
 
 # Standard reference ranges for common lab tests (test_code -> (low, high, unit))
@@ -116,41 +120,29 @@ LAB_REFERENCE_RANGES: Dict[str, Tuple[float, float, str]] = {
 
 
 class EDCWideAdapter:
-    """Adapter for parsing EDC system exports with wide-table structure.
+    """Intelligent adapter for parsing EDC system exports with dynamic structure detection.
     
-    This adapter handles Excel files exported from EDC systems that have:
-    - Complex multi-row headers (rows 1-7 contain metadata)
-    - Chinese variable names as column headers
-    - Wide-table format with multiple lab values per row
-    
-    It converts the complex structure to standard lab_values format
-    for downstream validation.
+    This adapter:
+    1. Auto-detects header rows using heuristic keyword matching
+    2. Uses fuzzy column name matching for flexible column identification
+    3. Transforms wide-table format to standard lab_values for validation
     
     Attributes:
-        file_path: Path to the input Excel/CSV file.
+        file_path: Path to the input file.
         dataframe: Parsed pandas DataFrame (after processing).
-        mapping: Dictionary mapping Chinese names to Test_Codes.
+        header_row: Detected header row index.
+        data_start_row: Detected data start row index.
     """
     
-    def __init__(
-        self,
-        file_path: str,
-        header_row_index: int = 3,  # Row 4 in Excel (1-based) = pandas index 3
-        data_start_row: int = 7,     # Row 8 in Excel (1-based) = pandas index 7
-    ) -> None:
+    def __init__(self, file_path: str) -> None:
         """Initialize the EDC Wide Adapter.
         
         Args:
             file_path: Path to the input file.
-            header_row_index: Row index (0-based in pandas) containing business column names.
-                              Default: 3 (Row 4 in Excel 1-based numbering).
-            data_start_row: Row index (0-based in pandas) where actual data begins.
-                           Default: 7 (Row 8 in Excel 1-based numbering).
         """
         self.file_path = Path(file_path)
-        self._header_row_index = header_row_index
-        self.data_start_row = data_start_row
-        self.mapping = CHINESE_TO_TEST_CODE_MAPPING.copy()
+        self.header_row: Optional[int] = None
+        self.data_start_row: Optional[int] = None
         self.dataframe: Optional[pd.DataFrame] = None
         self._parsed_data: List[Dict[str, Any]] = []
         
@@ -160,33 +152,28 @@ class EDCWideAdapter:
     def parse_lab_data(self) -> List[Dict[str, Any]]:
         """Parse EDC wide-table data and convert to standard format.
         
-        Reads the file, extracts business column names from the specified header row,
-        and converts wide-table structure to standard lab_values format.
+        Performs:
+        1. Heuristic header detection
+        2. Fuzzy column name matching
+        3. Wide-to-long transformation
         
         Returns:
-            List of dictionaries containing parsed clinical data with:
-            - Subject_ID
-            - Visit_Date
-            - lab_values: list of standardized lab test entries
-            
-        Raises:
-            Exception: If file parsing fails.
+            List of dictionaries with Subject_ID, Visit_Date, and lab_values.
         """
         logger.info(f"Parsing EDC wide-table file: {self.file_path}")
         
         try:
-            # Determine file type and read accordingly
-            ext = self.file_path.suffix.lower()
+            # Step 1: Detect table structure (header and data rows)
+            self._detect_table_structure()
             
-            if ext in (".xlsx", ".xls"):
-                self.dataframe = self._read_excel()
-            elif ext == ".csv":
-                self.dataframe = self._read_csv()
-            else:
-                raise ValueError(f"Unsupported file format: {ext}")
+            # Step 2: Read file with detected structure
+            self.dataframe = self._read_file_with_structure()
             
-            # Convert wide-table to long format with lab values
-            self._parsed_data = self._melt_wide_to_long()
+            # Step 3: Build column mapping with fuzzy matching
+            column_mapping = self._build_fuzzy_column_mapping()
+            
+            # Step 4: Transform wide-table to long format
+            self._parsed_data = self._transform_wide_to_long(column_mapping)
             
             logger.info(f"Successfully parsed {len(self._parsed_data)} records")
             return self._parsed_data
@@ -195,99 +182,253 @@ class EDCWideAdapter:
             logger.error(f"Failed to parse EDC file: {e}")
             raise
     
-    def _read_excel(self) -> pd.DataFrame:
-        """Read Excel file with fixed header row (Row 4 = index 3).
+    def _detect_table_structure(self) -> None:
+        """Heuristic dynamic header detection algorithm.
+        
+        Reads first 20 rows and finds:
+        - header_row: Row with most matches to clinical core vocabulary
+        - data_start_row: First data row after header (non-metadata)
+        """
+        logger.info("Detecting table structure using heuristics...")
+        
+        # Read first 20 rows without header - use on_bad_lines='skip' to handle irregular CSVs
+        ext = self.file_path.suffix.lower()
+        if ext in ('.xlsx', '.xls'):
+            df_preview = pd.read_excel(self.file_path, header=None, nrows=20)
+        elif ext == '.csv':
+            df_preview = pd.read_csv(
+                self.file_path, 
+                header=None, 
+                nrows=20, 
+                encoding='utf-8',
+                on_bad_lines='skip'  # Skip lines with irregular column counts
+            )
+        else:
+            df_preview = pd.read_csv(
+                self.file_path, 
+                header=None, 
+                nrows=20, 
+                encoding='utf-8',
+                on_bad_lines='skip'
+            )
+        
+        # Calculate keyword match score for each row
+        best_header_row = 0
+        best_header_score = 0
+        
+        for row_idx in range(min(20, len(df_preview))):
+            row = df_preview.iloc[row_idx]
+            row_text = " ".join([str(v) for v in row.values if pd.notna(v)])
+            
+            # Count matches with clinical vocabulary
+            score = sum(1 for keyword in CLINICAL_CORE_VOCABULARY if keyword in row_text)
+            
+            # Bonus for rows with multiple non-null values (likely column headers)
+            non_null_count = sum(1 for v in row.values if pd.notna(v))
+            score += non_null_count * 0.1
+            
+            # Penalize rows with metadata keywords
+            meta_penalty = sum(0.5 for keyword in METADATA_KEYWORDS if keyword in row_text)
+            score -= meta_penalty
+            
+            if score > best_header_score:
+                best_header_score = score
+                best_header_row = row_idx
+        
+        self.header_row = best_header_row
+        
+        # Find data start row (first non-empty, non-metadata row after header)
+        data_start = best_header_row + 1
+        for row_idx in range(data_start, min(25, len(df_preview))):
+            row = df_preview.iloc[row_idx]
+            row_text = " ".join([str(v) for v in row.values if pd.notna(v)])
+            
+            # Skip if empty or contains metadata keywords
+            if not row_text.strip():
+                continue
+            if any(kw in row_text for kw in METADATA_KEYWORDS):
+                continue
+            
+            # This looks like data row
+            data_start = row_idx
+            break
+        
+        self.data_start_row = data_start
+        
+        logger.info(f"Detected header at row {self.header_row}, data starts at row {self.data_start_row}")
+    
+    def _read_file_with_structure(self) -> pd.DataFrame:
+        """Read file using detected structure.
         
         Returns:
-            DataFrame with business column names as headers.
+            DataFrame with proper column names and data rows.
         """
-        logger.info(f"Reading Excel file with header at row index {self._header_row_index}")
+        logger.info(f"Reading file with header_row={self.header_row}, data_start={self.data_start_row}")
         
-        # Read Excel with fixed header row index (3 = Row 4 in Excel 1-based)
-        df = pd.read_excel(self.file_path, header=self._header_row_index)
+        ext = self.file_path.suffix.lower()
         
-        # Skip header row to get to data rows
-        df = df.iloc[self._header_row_index + 1:]
+        if ext in ('.xlsx', '.xls'):
+            df = pd.read_excel(self.file_path, header=self.header_row)
+        elif ext == '.csv':
+            df = pd.read_csv(
+                self.file_path, 
+                header=self.header_row, 
+                encoding='utf-8',
+                on_bad_lines='skip'
+            )
+        else:
+            df = pd.read_csv(
+                self.file_path, 
+                header=self.header_row, 
+                encoding='utf-8',
+                on_bad_lines='skip'
+            )
+        
+        # Get header row index in the DataFrame
+        header_idx = self.header_row
+        
+        # Skip to data rows (keep rows after header)
+        if len(df) > header_idx + 1:
+            df = df.iloc[header_idx + 1:]
         
         # Clean up column names
         df.columns = [str(col).strip() if pd.notna(col) else f"col_{i}" 
                       for i, col in enumerate(df.columns)]
         
-        # Drop columns that are entirely empty or unnamed metadata columns
-        df = df.loc[:, ~df.columns.str.match(r"^(col_\d+|Unnamed:\s*\d+)$")]
+        # Remove unnamed/empty columns
+        df = df.loc[:, ~df.columns.str.match(r"^(col_\d+|Unnamed:\s*\d+|nan)$", flags=re.IGNORECASE)]
         
-        # Drop rows that are all NaN
+        # Drop all-NaN rows
         df = df.dropna(how='all')
         
         logger.info(f"Read {len(df)} data rows, columns: {list(df.columns)}")
         return df
     
-    def _read_csv(self) -> pd.DataFrame:
-        """Read CSV file with fixed header row (Row 4 = index 3).
+    def _build_fuzzy_column_mapping(self) -> Dict[str, Dict[str, str]]:
+        """Build fuzzy column mapping using semantic matching.
         
         Returns:
-            DataFrame with business column names as headers.
+            Dictionary mapping standard column names to detected column names:
+            {
+                'subject_id': '患者研究编号',
+                'visit_date': '检查日期',
+                'lab_tests': {
+                    'WBC': {'value': '白细胞结果', 'unit': '白细胞单位'},
+                    ...
+                }
+            }
         """
-        logger.info(f"Reading CSV file with header at row index {self._header_row_index}")
+        logger.info("Building fuzzy column mapping...")
         
-        # Read CSV with fixed header row index (3 = Row 4 in 1-based numbering)
-        df = pd.read_csv(self.file_path, header=self._header_row_index, encoding='utf-8')
+        mapping: Dict[str, Any] = {
+            'subject_id': {},
+            'visit_date': {},
+            'lab_tests': {},
+        }
         
-        # Skip header row to get to data rows
-        df = df.iloc[self._header_row_index + 1:]
+        # Core column matching with similarity
+        core_columns = {
+            'subject_id': ['患者研究编号', '受试者编号', '患者编号', 'Subject_ID', 'SubjectID', 'subject_id', 'SUBJID', '受试者ID'],
+            'visit_date': ['检查日期', '访视日期', '检验日期', 'Visit_Date', 'visit_date', 'Date', '日期'],
+        }
         
-        # Clean up column names
-        df.columns = [str(col).strip() if pd.notna(col) else f"col_{i}" 
-                      for i, col in enumerate(df.columns)]
+        for col_name, variants in core_columns.items():
+            for col in self.dataframe.columns:
+                col_lower = str(col).lower()
+                for variant in variants:
+                    # Check exact substring match first, then fuzzy match
+                    if variant.lower() in col_lower or self._fuzzy_match(col_lower, variant.lower()) >= 0.8:
+                        mapping[col_name][variant] = col
+                        break
         
-        df = df.loc[:, ~df.columns.str.match(r"^(col_\d+|Unnamed:\s*\d+)$")]
-        df = df.dropna(how='all')
+        # Lab test column matching with fuzzy logic
+        for test_code, keywords in TEST_CODE_KEYWORDS.items():
+            mapping['lab_tests'][test_code] = {'value': None, 'unit': None}
+            
+            for col in self.dataframe.columns:
+                col_str = str(col)
+                col_lower = col_str.lower()
+                
+                # Check if column matches test code keywords (fuzzy: contains keyword OR similar)
+                matches_test = False
+                for kw in keywords:
+                    kw_lower = kw.lower()
+                    # Substring match or fuzzy similarity >= 0.6
+                    if kw_lower in col_lower or self._fuzzy_match(col_lower, kw_lower) >= 0.6:
+                        matches_test = True
+                        break
+                
+                if matches_test:
+                    # Determine if this is a value column or unit column
+                    is_unit = any(uw in col_lower for uw in ['单位', 'unit'])
+                    is_significance = any(sw in col_lower for sw in ['意义', 'significance', '参考', 'range', 'normal'])
+                    
+                    if is_unit:
+                        mapping['lab_tests'][test_code]['unit'] = col
+                    elif not is_significance:
+                        # This should be the value column
+                        if mapping['lab_tests'][test_code]['value'] is None:
+                            mapping['lab_tests'][test_code]['value'] = col
         
-        logger.info(f"Read {len(df)} data rows, columns: {list(df.columns)}")
-        return df
+        logger.info(f"Column mapping built: {mapping}")
+        return mapping
     
-    def _melt_wide_to_long(self) -> List[Dict[str, Any]]:
-        """Convert wide-table format to standard long format with lab_values.
+    def _fuzzy_match(self, text1: str, text2: str) -> float:
+        """Calculate fuzzy match similarity score using SequenceMatcher.
         
-        Extracts subject information and maps Chinese column names to
-        standardized lab test entries.
+        Args:
+            text1: First text string.
+            text2: Second text string.
+            
+        Returns:
+            Similarity score between 0 and 1.
+        """
+        return SequenceMatcher(None, text1, text2).ratio()
+    
+    def _transform_wide_to_long(self, column_mapping: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Transform wide-table format to standard long format with lab_values.
         
+        Args:
+            column_mapping: Mapping of column names from fuzzy matching.
+            
         Returns:
             List of records with Subject_ID, Visit_Date, and lab_values.
         """
         records: List[Dict[str, Any]] = []
         
-        # Identify subject ID and visit date columns
-        subject_col = self._find_column(["患者研究编号", "Subject_ID", "subject_id", "受试者编号"])
-        date_col = self._find_column(["检查日期", "Visit_Date", "visit_date", "访视日期", "检验日期"])
+        # Get subject and date columns
+        subject_col = self._get_best_match(column_mapping.get('subject_id', {}))
+        date_col = self._get_best_match(column_mapping.get('visit_date', {}))
         
-        logger.info(f"Identified subject column: {subject_col}, date column: {date_col}")
+        logger.info(f"Using subject column: {subject_col}, date column: {date_col}")
         
         for idx, row in self.dataframe.iterrows():
             try:
                 # Extract subject and visit information
                 subject_id = self._safe_get_value(row, subject_col) if subject_col else None
-                visit_date = self._safe_get_value(row, date_col) if date_col else None
                 
-                # Skip rows without subject ID
                 if not subject_id or pd.isna(subject_id):
                     continue
                 
-                # Build lab values list from mapped columns
+                # Build lab values from mapped columns
                 lab_values: List[Dict[str, Any]] = []
                 
-                for chinese_name, test_code in self.mapping.items():
-                    if chinese_name in self.dataframe.columns:
-                        value = self._safe_get_numeric_value(row, chinese_name)
+                for test_code, col_info in column_mapping.get('lab_tests', {}).items():
+                    value_col = col_info.get('value')
+                    unit_col = col_info.get('unit')
+                    
+                    if value_col and value_col in self.dataframe.columns:
+                        value = self._safe_get_numeric_value(row, value_col)
                         if value is not None:
-                            # Get unit from adjacent column or use default
-                            unit = self._get_unit_for_test(test_code)
+                            unit = self._safe_get_value(row, unit_col) if unit_col else self._get_unit_for_test(test_code)
+                            if unit is None:
+                                unit = self._get_unit_for_test(test_code)
                             
                             lab_entry = {
                                 "test_code": test_code,
                                 "test_name": test_code,
                                 "value": value,
-                                "unit": unit,
+                                "unit": str(unit).strip() if unit else "",
                             }
                             lab_values.append(lab_entry)
                 
@@ -296,11 +437,10 @@ class EDCWideAdapter:
                     "Subject_ID": str(subject_id).strip(),
                 }
                 
-                if visit_date:
-                    if isinstance(visit_date, str):
-                        record["Visit_Date"] = visit_date
-                    else:
-                        record["Visit_Date"] = str(visit_date)
+                # Add visit date if found
+                visit_date = self._safe_get_value(row, date_col) if date_col else None
+                if visit_date and not pd.isna(visit_date):
+                    record["Visit_Date"] = str(visit_date)
                 
                 if lab_values:
                     record["lab_values"] = lab_values
@@ -313,28 +453,23 @@ class EDCWideAdapter:
         
         return records
     
-    def _find_column(self, possible_names: List[str]) -> Optional[str]:
-        """Find a column that matches one of the possible names.
+    def _get_best_match(self, mapping_dict: Dict[str, str]) -> Optional[str]:
+        """Get the best non-null match from a mapping dictionary.
         
         Args:
-            possible_names: List of column name variants to search for.
+            mapping_dict: Dictionary of possible column matches.
             
         Returns:
-            Matching column name or None if not found.
+            Best matching column name or None.
         """
-        for name in possible_names:
-            if name in self.dataframe.columns:
-                return name
-        
-        # Try case-insensitive match
-        cols_lower = {c.lower(): c for c in self.dataframe.columns}
-        for name in possible_names:
-            if name.lower() in cols_lower:
-                return cols_lower[name.lower()]
-        
+        if not mapping_dict:
+            return None
+        for col in mapping_dict.values():
+            if col:
+                return col
         return None
     
-    def _safe_get_value(self, row: pd.Series, column: str) -> Any:
+    def _safe_get_value(self, row: pd.Series, column: Optional[str]) -> Any:
         """Safely get a value from a DataFrame row.
         
         Args:
@@ -344,12 +479,10 @@ class EDCWideAdapter:
         Returns:
             Value or None if not available.
         """
-        if column and column in row.index:
-            val = row[column]
-            if pd.isna(val):
-                return None
-            return val
-        return None
+        if not column or column not in row.index:
+            return None
+        val = row[column]
+        return None if pd.isna(val) else val
     
     def _safe_get_numeric_value(self, row: pd.Series, column: str) -> Optional[float]:
         """Safely get a numeric value from a DataFrame row.
@@ -384,15 +517,20 @@ class EDCWideAdapter:
             return unit
         return ""
     
-    def add_mapping(self, chinese_name: str, test_code: str) -> None:
-        """Add a custom mapping from Chinese name to test code.
+    def add_lab_test_mapping(self, test_code: str, keywords: List[str], unit_keywords: Optional[List[str]] = None) -> None:
+        """Add custom lab test mapping for fuzzy matching.
         
         Args:
-            chinese_name: Chinese column name in the Excel file.
             test_code: Standard test code (e.g., "WBC").
+            keywords: Keywords to match column names (e.g., ["白细胞", "WBC"]).
+            unit_keywords: Optional keywords for unit columns.
         """
-        self.mapping[chinese_name] = test_code
-        logger.info(f"Added custom mapping: {chinese_name} -> {test_code}")
+        if test_code not in TEST_CODE_KEYWORDS:
+            TEST_CODE_KEYWORDS[test_code] = keywords
+        else:
+            TEST_CODE_KEYWORDS[test_code].extend(keywords)
+        
+        logger.info(f"Added custom mapping for {test_code}: {keywords}")
     
     def get_parsed_data(self) -> List[Dict[str, Any]]:
         """Get the parsed data after calling parse_lab_data().
