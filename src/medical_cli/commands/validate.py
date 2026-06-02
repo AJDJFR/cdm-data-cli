@@ -657,7 +657,7 @@ def _export_sanitized_excel(
     """
     try:
         from openpyxl import Workbook
-        from openpyxl.styles import PatternFill, Font
+        from openpyxl.styles import PatternFill, Font, Alignment
     except ImportError:
         logger.warning("openpyxl not installed. Cannot export Excel file.")
         click.echo(
@@ -757,15 +757,18 @@ def _export_sanitized_excel(
                 flag_cell.fill = warning_fill
                 flag_cell.font = Font(color="856404")
         
-        # Auto-adjust column widths
+        # Auto-adjust column widths with safe type conversion
         for column in ws.columns:
             max_length = 0
             column_letter = column[0].column_letter
             for cell in column:
                 try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
+                    # Safe conversion: use 'or' to handle None/empty values
+                    cell_value = cell.value if cell.value is not None else ''
+                    cell_str = str(cell_value)
+                    max_length = max(max_length, len(cell_str))
+                except (AttributeError, TypeError):
+                    # Skip cells that cannot be converted to string
                     pass
             adjusted_width = min(max_length + 2, 50)
             ws.column_dimensions[column_letter].width = adjusted_width

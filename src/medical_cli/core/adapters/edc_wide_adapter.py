@@ -205,6 +205,7 @@ class EDCWideAdapter:
         3. Primary key format dynamic anchoring:
            - Detect subject ID patterns (non-Chinese, hyphenated, fixed prefixes)
            - Find the first row that matches primary key format
+        4. Windows CSV encoding auto-detection (utf-8 → gbk → gb18030)
         
         Sets:
         - header_row: Row with most clinical vocabulary matches
@@ -217,20 +218,13 @@ class EDCWideAdapter:
         if ext in ('.xlsx', '.xls'):
             df_preview = pd.read_excel(self.file_path, header=None, nrows=20)
         elif ext == '.csv':
-            df_preview = pd.read_csv(
-                self.file_path, 
-                header=None, 
-                nrows=20, 
-                encoding='utf-8',
-                on_bad_lines='skip'
+            # Windows CSV encoding auto-detection: utf-8 → gbk → gb18030
+            df_preview = self._read_csv_with_encoding_fallback(
+                self.file_path, header=None, nrows=20, on_bad_lines='skip'
             )
         else:
-            df_preview = pd.read_csv(
-                self.file_path, 
-                header=None, 
-                nrows=20, 
-                encoding='utf-8',
-                on_bad_lines='skip'
+            df_preview = self._read_csv_with_encoding_fallback(
+                self.file_path, header=None, nrows=20, on_bad_lines='skip'
             )
         
         # Step 1: Find header row (clinical vocabulary matching)
@@ -369,26 +363,29 @@ class EDCWideAdapter:
         if ext in ('.xlsx', '.xls'):
             df = pd.read_excel(self.file_path, header=self.header_row)
         elif ext == '.csv':
-            df = pd.read_csv(
-                self.file_path, 
-                header=self.header_row, 
-                encoding='utf-8',
-                on_bad_lines='skip'
+            df = self._read_csv_with_encoding_fallback(
+                self.file_path, header=self.header_row, on_bad_lines='skip'
             )
         else:
-            df = pd.read_csv(
-                self.file_path, 
-                header=self.header_row, 
-                encoding='utf-8',
-                on_bad_lines='skip'
+            df = self._read_csv_with_encoding_fallback(
+                self.file_path, header=self.header_row, on_bad_lines='skip'
             )
         
-        # Calculate rows to skip after header to reach data_start_row
-        rows_to_skip = self.data_start_row - self.header_row
+        # CRITICAL FIX: Calculate rows to skip correctly after header is consumed
+        # When pd.read_csv(..., header=N) executes:
+        #   - Rows 0 to N in raw file become the column names
+        #   - df.iloc[0] corresponds to raw row N+1 (first data row after header)
+        #   - If we need to reach raw row data_start_row, we skip (data_start_row - header_row - 1) rows
+        rows_to_skip = self.data_start_row - self.header_row - 1
+        
+        logger.info(f"Skipping {rows_to_skip} control rows to reach data_start_row={self.data_start_row}")
+        logger.info(f"Expected first data row: {df.index[rows_to_skip] if rows_to_skip < len(df) else 'N/A'}")
         
         # Skip to data rows
         if rows_to_skip > 0 and len(df) > rows_to_skip:
             df = df.iloc[rows_to_skip:]
+        elif rows_to_skip > 0:
+            df = df.iloc[len(df):]  # Empty DataFrame if not enough rows
         
         # Clean up column names
         df.columns = [str(col).strip() if pd.notna(col) else f"col_{i}" 
@@ -402,6 +399,37 @@ class EDCWideAdapter:
         
         logger.info(f"Read {len(df)} data rows, columns: {list(df.columns)}")
         return df
+    
+    def _read_csv_with_encoding_fallback(self, file_path: Path, **kwargs) -> pd.DataFrame:
+        """Read CSV with automatic encoding fallback for Windows compatibility.
+        
+        Tries encodings in order: utf-8 → gbk → gb18030
+        Ensures Windows-exported CSV files with Chinese content are readable.
+        
+        Args:
+            file_path: Path to the CSV file.
+            **kwargs: Additional arguments passed to pd.read_csv.
+            
+        Returns:
+            DataFrame read with the correct encoding.
+        """
+        encodings_to_try = ['utf-8', 'gbk', 'gb18030', 'latin1']
+        
+        for encoding in encodings_to_try:
+            try:
+                df = pd.read_csv(file_path, encoding=encoding, **kwargs)
+                logger.info(f"Successfully read CSV with encoding: {encoding}")
+                return df
+            except UnicodeDecodeError as e:
+                logger.warning(f"Failed to read with encoding '{encoding}': {e}")
+                continue
+            except Exception as e:
+                logger.warning(f"Unexpected error with encoding '{encoding}': {e}")
+                continue
+        
+        # Last resort: try with errors='replace'
+        logger.warning("All encoding attempts failed, trying errors='replace'")
+        return pd.read_csv(file_path, encoding='utf-8', errors='replace', **kwargs)
     
     def _build_fuzzy_column_mapping(self) -> Dict[str, Dict[str, str]]:
         """Build fuzzy column mapping using semantic matching.
