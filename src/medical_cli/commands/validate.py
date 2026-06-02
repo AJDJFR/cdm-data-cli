@@ -425,9 +425,9 @@ def validate_labs(
 def _prepare_row_for_validation(row: Dict[str, Any]) -> Dict[str, Any]:
     """Prepare a row dictionary for ClinicalSubjectBase validation.
     
-    Converts string values to proper types where needed.
-    Handles flat Excel structure by extracting Test_Code, Value, Unit columns
-    and assembling them into lab_values list.
+    Parses flat Excel structure with independent Test_Code, Value, Unit columns.
+    Each row may contain multiple lab tests - extracts all and assembles into
+    lab_values list for Pydantic validation.
     
     Args:
         row: Raw row data from Excel/CSV.
@@ -438,54 +438,50 @@ def _prepare_row_for_validation(row: Dict[str, Any]) -> Dict[str, Any]:
     prepared: Dict[str, Any] = {}
     lab_values: List[Dict[str, Any]] = []
     
+    # Extract Test_Code, Value, Unit columns directly
+    # Excel structure: Test_Code, Value, Unit (independent columns per row)
+    test_code = row.get("Test_Code") or row.get("test_code") or row.get("Test_Code", "").strip()
+    value = row.get("Value") or row.get("value")
+    unit = row.get("Unit") or row.get("unit") or row.get("Unit", "").strip()
+    
+    # If Test_Code has value and Value is not empty, create lab entry
+    if test_code and value is not None and value != "":
+        try:
+            lab_entry = {
+                "test_code": str(test_code).upper().strip(),
+                "test_name": str(test_code).strip(),  # Use test_code as name if no separate name column
+                "value": float(value),
+                "unit": str(unit).strip() if unit else "",
+            }
+            lab_values.append(lab_entry)
+        except (ValueError, TypeError):
+            # Skip invalid numeric values
+            pass
+    
+    # Handle other fields
     for key, value in row.items():
         # Skip empty values
         if value is None or value == "":
             continue
         
-        # Handle specific fields
+        # Skip Test_Code/Value/Unit columns (already processed)
         key_lower = key.lower()
+        if key_lower in ("test_code", "value", "unit"):
+            continue
         
+        # Handle specific fields
         if key_lower == "age":
             try:
                 prepared[key] = int(float(value))
             except (ValueError, TypeError):
                 prepared[key] = value
         elif key_lower in ("visit_date", "date", "date_of_visit"):
-            # Ensure date is in proper format
             if isinstance(value, str):
                 prepared[key] = value
             else:
                 prepared[key] = str(value)
         elif key_lower == "gender":
             prepared[key] = str(value).upper().strip()
-        elif "_value" in key_lower:
-            # Flat Excel structure: extract Test_Code from column name
-            # e.g., "WBC_Value" -> test_code="WBC"
-            # Expected pattern: {Test_Code}_Value, {Test_Code}_Unit, {Test_Code}_UnitName (optional)
-            test_code = key.replace("_Value", "").replace("_value", "").strip()
-            
-            # Find corresponding unit column (e.g., WBC_Unit)
-            unit_key = f"{test_code}_Unit"
-            unit_value = row.get(unit_key, row.get(f"{test_code}_unit", ""))
-            
-            # Get test name from optional column or use test_code
-            test_name_key = f"{test_code}_Test_Name"
-            test_name = row.get(test_name_key, test_code)
-            
-            # Only add if we have a valid value
-            if value:
-                try:
-                    lab_entry = {
-                        "test_code": test_code.upper(),
-                        "test_name": str(test_name).strip() if test_name else test_code,
-                        "value": float(value),
-                        "unit": str(unit_value).strip() if unit_value else "",
-                    }
-                    lab_values.append(lab_entry)
-                except (ValueError, TypeError):
-                    # Skip invalid numeric values
-                    pass
         else:
             prepared[key] = value
     
