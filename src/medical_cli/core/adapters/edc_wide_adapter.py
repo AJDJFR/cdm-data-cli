@@ -36,12 +36,24 @@ CLINICAL_CORE_VOCABULARY: Set[str] = {
     "ID", "Lab", "Test", "Result", "Value", "Unit", "Normal", "Range",
 }
 
-# Metadata keywords that indicate non-data rows
+# Metadata keywords that indicate non-data rows (control rows)
 METADATA_KEYWORDS: Set[str] = {
+    # Chinese control metadata
     "变量", "Variable", "变量ID", "VariableID", "类型", "Type",
     "必答", "Required", "必填", "必选", "格式", "Format", "长度", "Length",
     "选项", "Options", "范围", "Range", "默认值", "Default",
     "DataType", "Label", "Section", "Form", "CRF",
+    # Control row specific keywords (for filtering after header)
+    "选项编码", "编码", "是否必答", "是否必填", "单选题", "多选题",
+    "文本题", "填空题", "下拉框", "复选框", "矩阵题",
+    "题号", "题目", "题目描述", "变量说明",
+    "填写说明", "注释", "备注", "说明",
+}
+
+# Control row patterns - high repetition indicators
+CONTROL_REPETITION_PATTERNS: Set[str] = {
+    "Y", "N", "是", "否", "文本", "数值", "日期", "选项", "选项1", "选项2",
+    "必填", "非必填", "必答", "非必答", "是", "否", "请选择", "请输入",
 }
 
 # Test code keywords for column classification
@@ -183,15 +195,24 @@ class EDCWideAdapter:
             raise
     
     def _detect_table_structure(self) -> None:
-        """Heuristic dynamic header detection algorithm.
+        """Ultimate 4.0 dynamic header and data detection algorithm.
         
-        Reads first 20 rows and finds:
-        - header_row: Row with most matches to clinical core vocabulary
-        - data_start_row: First data row after header (non-metadata)
+        Features:
+        1. Heuristic header row detection using clinical vocabulary
+        2. Control row intelligent filtering:
+           - Keyword interception for system metadata
+           - Repetition rate and null value statistics
+        3. Primary key format dynamic anchoring:
+           - Detect subject ID patterns (non-Chinese, hyphenated, fixed prefixes)
+           - Find the first row that matches primary key format
+        
+        Sets:
+        - header_row: Row with most clinical vocabulary matches
+        - data_start_row: First real data row (not control metadata)
         """
-        logger.info("Detecting table structure using heuristics...")
+        logger.info("4.0 Engine: Detecting table structure with metadata filtering...")
         
-        # Read first 20 rows without header - use on_bad_lines='skip' to handle irregular CSVs
+        # Read first 20 rows without header
         ext = self.file_path.suffix.lower()
         if ext in ('.xlsx', '.xls'):
             df_preview = pd.read_excel(self.file_path, header=None, nrows=20)
@@ -201,7 +222,7 @@ class EDCWideAdapter:
                 header=None, 
                 nrows=20, 
                 encoding='utf-8',
-                on_bad_lines='skip'  # Skip lines with irregular column counts
+                on_bad_lines='skip'
             )
         else:
             df_preview = pd.read_csv(
@@ -212,7 +233,7 @@ class EDCWideAdapter:
                 on_bad_lines='skip'
             )
         
-        # Calculate keyword match score for each row
+        # Step 1: Find header row (clinical vocabulary matching)
         best_header_row = 0
         best_header_score = 0
         
@@ -221,41 +242,119 @@ class EDCWideAdapter:
             row_text = " ".join([str(v) for v in row.values if pd.notna(v)])
             
             # Count matches with clinical vocabulary
-            score = sum(1 for keyword in CLINICAL_CORE_VOCABULARY if keyword in row_text)
+            clinical_score = sum(1 for keyword in CLINICAL_CORE_VOCABULARY if keyword in row_text)
             
             # Bonus for rows with multiple non-null values (likely column headers)
             non_null_count = sum(1 for v in row.values if pd.notna(v))
-            score += non_null_count * 0.1
+            clinical_score += non_null_count * 0.1
             
             # Penalize rows with metadata keywords
             meta_penalty = sum(0.5 for keyword in METADATA_KEYWORDS if keyword in row_text)
-            score -= meta_penalty
+            clinical_score -= meta_penalty
             
-            if score > best_header_score:
-                best_header_score = score
+            if clinical_score > best_header_score:
+                best_header_score = clinical_score
                 best_header_row = row_idx
         
         self.header_row = best_header_row
+        logger.info(f"[Step 1] Header detected at pandas row {best_header_row} (Excel row {best_header_row + 1})")
         
-        # Find data start row (first non-empty, non-metadata row after header)
-        data_start = best_header_row + 1
-        for row_idx in range(data_start, min(25, len(df_preview))):
+        # Step 2: Find first real data row after header (control row filtering)
+        # Primary key patterns for detection
+        subject_id_patterns = [
+            r'^[A-Z]{2,4}-\d+',  # FDC-005, SITE-001
+            r'^SITE-', r'^SUBJ', r'^PAT', r'^CID',
+            r'^\d{3,}.*-?\d+',   # Numeric IDs like 10134-001
+            r'^[A-Z]\d{5,}',     # Single letter prefix with digits
+        ]
+        import re
+        subject_pattern_re = re.compile('|'.join(subject_id_patterns), re.IGNORECASE)
+        
+        data_start = None
+        control_row_indices = []
+        
+        logger.info(f"[Step 2] Scanning rows after header for control row filtering...")
+        
+        for row_idx in range(best_header_row + 1, min(30, len(df_preview))):
             row = df_preview.iloc[row_idx]
-            row_text = " ".join([str(v) for v in row.values if pd.notna(v)])
+            row_values = [str(v) for v in row.values if pd.notna(v)]
+            row_text = " ".join(row_values)
             
-            # Skip if empty or contains metadata keywords
+            # Skip completely empty rows
             if not row_text.strip():
-                continue
-            if any(kw in row_text for kw in METADATA_KEYWORDS):
+                logger.info(f"  Row {row_idx}: Empty, skipping")
                 continue
             
-            # This looks like data row
-            data_start = row_idx
-            break
+            # Feature 2a: Keyword interception - check first few cells for control keywords
+            first_cells = [str(row.iloc[i]) if i < len(row) else "" for i in range(min(3, len(row)))]
+            first_cells_text = " ".join(first_cells)
+            
+            control_detected = False
+            for keyword in METADATA_KEYWORDS:
+                if keyword in first_cells_text:
+                    control_detected = True
+                    control_row_indices.append(row_idx)
+                    logger.info(f"  Row {row_idx}: CONTROL (keyword '{keyword}' in first cells: {first_cells_text[:50]})")
+                    break
+            
+            if control_detected:
+                continue
+            
+            # Feature 2b: Repetition rate check
+            # Count repeated values vs unique values
+            non_empty_values = [v.strip() for v in row_values if v.strip()]
+            if len(non_empty_values) >= 3:
+                unique_values = set(non_empty_values)
+                # If 60%+ values are the same, it's likely a control row
+                max_repeat = max(non_empty_values.count(v) for v in unique_values) if unique_values else 0
+                repeat_ratio = max_repeat / len(non_empty_values) if non_empty_values else 0
+                
+                if repeat_ratio >= 0.6:
+                    control_detected = True
+                    control_row_indices.append(row_idx)
+                    logger.info(f"  Row {row_idx}: CONTROL (high repetition: {repeat_ratio:.1%}, values: {non_empty_values[:5]})")
+                    continue
+            
+            # Feature 2c: Null value rate check
+            null_count = sum(1 for v in row.values if pd.isna(v) or str(v).strip() == '')
+            null_ratio = null_count / len(row.values) if len(row.values) > 0 else 1.0
+            
+            if null_ratio >= 0.8:  # 80%+ null
+                control_detected = True
+                control_row_indices.append(row_idx)
+                logger.info(f"  Row {row_idx}: CONTROL (high null ratio: {null_ratio:.1%})")
+                continue
+            
+            # Step 3: Primary key format dynamic anchoring
+            # Check if first column matches subject ID pattern
+            first_col_value = str(row.iloc[0]) if len(row) > 0 else ""
+            
+            if subject_pattern_re.match(first_col_value.strip()):
+                data_start = row_idx
+                logger.info(f"[Step 3] PRIMARY KEY DETECTED at row {row_idx}: '{first_col_value}' matches subject ID pattern")
+                break
+            else:
+                # Not a subject ID row but also not control - might be another metadata row
+                logger.info(f"  Row {row_idx}: Potential data row but first cell '{first_col_value}' doesn't match subject pattern, skipping")
+                continue
         
-        self.data_start_row = data_start
+        # Fallback: if no subject pattern found, use first non-control row
+        if data_start is None:
+            for row_idx in range(best_header_row + 1, min(30, len(df_preview))):
+                if row_idx not in control_row_indices:
+                    row = df_preview.iloc[row_idx]
+                    row_values = [str(v) for v in row.values if pd.notna(v)]
+                    if row_values:
+                        data_start = row_idx
+                        first_cell = str(row.iloc[0]) if len(row) > 0 else ""
+                        logger.info(f"[Fallback] Using first non-control row {row_idx} (first cell: '{first_cell}')")
+                        break
         
-        logger.info(f"Detected header at row {self.header_row}, data starts at row {self.data_start_row}")
+        self.data_start_row = data_start if data_start is not None else best_header_row + 1
+        
+        logger.info(f"[Final] Header at pandas row {self.header_row} (Excel row {self.header_row + 1})")
+        logger.info(f"[Final] Data starts at pandas row {self.data_start_row} (Excel row {self.data_start_row + 1})")
+        logger.info(f"[Final] Control rows filtered: {control_row_indices}")
     
     def _read_file_with_structure(self) -> pd.DataFrame:
         """Read file using detected structure.
@@ -284,12 +383,12 @@ class EDCWideAdapter:
                 on_bad_lines='skip'
             )
         
-        # Get header row index in the DataFrame
-        header_idx = self.header_row
+        # Calculate rows to skip after header to reach data_start_row
+        rows_to_skip = self.data_start_row - self.header_row
         
-        # Skip to data rows (keep rows after header)
-        if len(df) > header_idx + 1:
-            df = df.iloc[header_idx + 1:]
+        # Skip to data rows
+        if rows_to_skip > 0 and len(df) > rows_to_skip:
+            df = df.iloc[rows_to_skip:]
         
         # Clean up column names
         df.columns = [str(col).strip() if pd.notna(col) else f"col_{i}" 
