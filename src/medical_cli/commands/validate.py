@@ -5,7 +5,9 @@ including the specialized validate_labs subcommand for Excel laboratory results.
 """
 
 import json
+import os
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import click
@@ -98,12 +100,22 @@ def validate_group():
     default=False,
     help="Only report records with abnormal lab values in the output.",
 )
+@click.option(
+    "--export-excel",
+    "-e",
+    "export_excel",
+    is_flag=True,
+    default=False,
+    help="Export sanitized Excel with validation flags. "
+         "Creates [filename]_sanitized.xlsx with PHI masked and validation flags.",
+)
 def validate_labs(
     input_file: str,
     output_file: Optional[str],
     strict: bool,
     verbose: bool,
     abnormal_only: bool,
+    export_excel: bool,
 ) -> None:
     """Validate Excel laboratory test results with PHI sanitization.
     
@@ -114,6 +126,7 @@ def validate_labs(
     3. Validates each record against clinical data schemas
     4. Checks laboratory values against reference ranges
     5. Generates a comprehensive validation report
+    6. Optionally exports a sanitized Excel with validation flags
     
     \b
     Examples:
@@ -125,6 +138,10 @@ def validate_labs(
     \b
     # Save report to file:
         medical-cli validate labs -i lab_results.xlsx -o report.json
+    
+    \b
+    # Export sanitized Excel with validation flags:
+        medical-cli validate labs -i lab_results.xlsx -e
     
     \b
     # Strict mode with verbose output:
@@ -358,7 +375,7 @@ def validate_labs(
             )
         
         # -----------------------------------------------------------------
-        # Step 3: Generate report
+        # Step 3: Generate report and optionally export Excel
         # -----------------------------------------------------------------
         if verbose:
             click.echo("\n[Step 3/3] Generating validation report...")
@@ -373,6 +390,10 @@ def validate_labs(
         
         # Output report
         _output_report(report, output_file)
+        
+        # Export sanitized Excel if requested
+        if export_excel:
+            _export_sanitized_excel(extractor, report, verbose)
         
         # Print summary to terminal
         _print_summary(report, verbose)
@@ -533,6 +554,158 @@ def _validate_lab_values(
             )
     
     return results
+
+
+def _export_sanitized_excel(
+    extractor: EDCDataExtractor,
+    report: Dict[str, Any],
+    verbose: bool,
+) -> None:
+    """Export sanitized Excel file with validation flags.
+    
+    Creates a new Excel file with:
+    1. PHI masked data from extractor
+    2. Validation_Flags column with warnings for each row
+    
+    Args:
+        extractor: EDCDataExtractor instance with sanitized data
+        report: Validation report with row issues and lab validation
+        verbose: Enable verbose output
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import PatternFill, Font
+    except ImportError:
+        logger.warning("openpyxl not installed. Cannot export Excel file.")
+        click.echo(
+            click.style(
+                "Warning: openpyxl not installed. Cannot export Excel. "
+                "Install with: pip install openpyxl",
+                fg="yellow",
+            )
+        )
+        return
+    
+    input_path = extractor.input_path
+    output_path = input_path.parent / f"{input_path.stem}_sanitized.xlsx"
+    
+    try:
+        # Get sanitized data from extractor
+        sanitized_data = extractor._raw_data
+        
+        if not sanitized_data:
+            logger.warning("No data to export")
+            return
+        
+        # Create workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Clinical Data"
+        
+        # Get headers from first row and add Validation_Flags
+        headers = list(sanitized_data[0].keys()) + ["Validation_Flags"]
+        
+        # Write header row
+        ws.append(headers)
+        
+        # Build row -> issues mapping from report
+        row_issues: Dict[int, List[str]] = {}
+        
+        # Map abnormal lab values to rows
+        for abn in report.get("lab_validation", {}).get("abnormal_values", []):
+            row_num = abn.get("row", 0)
+            if row_num not in row_issues:
+                row_issues[row_num] = []
+            
+            test_code = abn.get("test_code", "")
+            value = abn.get("value", 0)
+            ref = abn.get("reference_range", "")
+            
+            # Parse reference range to determine if High or Low
+            try:
+                if " - " in ref:
+                    parts = ref.split(" - ")
+                    ref_low = float(parts[0].strip())
+                    ref_high = float(parts[1].strip())
+                    if value < ref_low:
+                        flag = f"{test_code}: {value} (Low)"
+                    elif value > ref_high:
+                        flag = f"{test_code}: {value} (High)"
+                    else:
+                        flag = f"{test_code}: {value}"
+                else:
+                    flag = f"{test_code}: {value}"
+            except (ValueError, TypeError):
+                flag = f"{test_code}: {value}"
+            
+            row_issues[row_num].append(flag)
+        
+        # Map missing required fields to rows
+        for missing in report.get("lab_validation", {}).get("missing_required", []):
+            row_num = missing.get("row", 0)
+            if row_num not in row_issues:
+                row_issues[row_num] = []
+            row_issues[row_num].append(f"Error: {missing.get('error', 'Missing required field')}")
+        
+        # Write data rows
+        for row_idx, row_data in enumerate(sanitized_data, start=2):  # start=2 for Excel row (1-indexed, header=1)
+            row_values = list(row_data.values())
+            
+            # Get validation flags for this row
+            excel_row_num = row_idx - 1  # Convert to 1-based Excel row number
+            flags = row_issues.get(excel_row_num, [])
+            validation_flag = "; ".join(flags) if flags else ""
+            row_values.append(validation_flag)
+            
+            ws.append(row_values)
+        
+        # Style header row
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        
+        # Style rows with validation flags (highlight issues)
+        warning_fill = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+        for row in ws.iter_rows(min_row=2):
+            flag_cell = row[-1]  # Last column is Validation_Flags
+            if flag_cell.value:
+                flag_cell.fill = warning_fill
+                flag_cell.font = Font(color="856404")
+        
+        # Auto-adjust column widths
+        for column in ws.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+            for cell in column:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            ws.column_dimensions[column_letter].width = adjusted_width
+        
+        # Save workbook
+        wb.save(output_path)
+        
+        logger.info(f"Exported sanitized Excel: {output_path}")
+        
+        if verbose:
+            flagged_rows = sum(1 for v in row_issues.values() if v)
+            click.echo(
+                f"\n  ✓ Exported sanitized Excel: {output_path.name} "
+                f"({flagged_rows} rows with validation flags)"
+            )
+        else:
+            click.echo(f"\n✓ Exported sanitized Excel: {output_path}")
+        
+    except Exception as e:
+        logger.error(f"Failed to export Excel: {e}")
+        click.echo(
+            click.style(f"Warning: Could not export sanitized Excel: {e}", fg="yellow")
+        )
 
 
 def _output_report(report: Dict[str, Any], output_file: Optional[str]) -> None:
