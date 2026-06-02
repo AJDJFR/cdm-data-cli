@@ -252,6 +252,7 @@ def validate_labs(
         abnormal_records: List[Dict[str, Any]] = []
         unit_errors: List[Dict[str, Any]] = []
         missing_required: List[Dict[str, Any]] = []
+        total_lab_values: int = 0
         
         for row_idx, row in enumerate(data, start=1):
             row_has_data = any(v for v in row.values() if v)
@@ -279,6 +280,8 @@ def validate_labs(
                 
                 # Validate lab values if present
                 if subject.lab_values:
+                    total_lab_values += len(subject.lab_values)
+                    
                     lab_results = _validate_lab_values(
                         subject.Subject_ID,
                         subject.lab_values,
@@ -339,7 +342,7 @@ def validate_labs(
         
         # Update lab validation summary
         report["lab_validation"] = {
-            "total_lab_values": report["summary"]["abnormal_count"],
+            "total_lab_values": total_lab_values,
             "abnormal_values": abnormal_records,
             "unit_errors": unit_errors,
             "missing_required": missing_required,
@@ -402,6 +405,8 @@ def _prepare_row_for_validation(row: Dict[str, Any]) -> Dict[str, Any]:
     """Prepare a row dictionary for ClinicalSubjectBase validation.
     
     Converts string values to proper types where needed.
+    Handles flat Excel structure by extracting Test_Code, Value, Unit columns
+    and assembling them into lab_values list.
     
     Args:
         row: Raw row data from Excel/CSV.
@@ -410,6 +415,7 @@ def _prepare_row_for_validation(row: Dict[str, Any]) -> Dict[str, Any]:
         Dictionary with properly typed values for validation.
     """
     prepared: Dict[str, Any] = {}
+    lab_values: List[Dict[str, Any]] = []
     
     for key, value in row.items():
         # Skip empty values
@@ -432,8 +438,39 @@ def _prepare_row_for_validation(row: Dict[str, Any]) -> Dict[str, Any]:
                 prepared[key] = str(value)
         elif key_lower == "gender":
             prepared[key] = str(value).upper().strip()
+        elif "_value" in key_lower:
+            # Flat Excel structure: extract Test_Code from column name
+            # e.g., "WBC_Value" -> test_code="WBC"
+            # Expected pattern: {Test_Code}_Value, {Test_Code}_Unit, {Test_Code}_UnitName (optional)
+            test_code = key.replace("_Value", "").replace("_value", "").strip()
+            
+            # Find corresponding unit column (e.g., WBC_Unit)
+            unit_key = f"{test_code}_Unit"
+            unit_value = row.get(unit_key, row.get(f"{test_code}_unit", ""))
+            
+            # Get test name from optional column or use test_code
+            test_name_key = f"{test_code}_Test_Name"
+            test_name = row.get(test_name_key, test_code)
+            
+            # Only add if we have a valid value
+            if value:
+                try:
+                    lab_entry = {
+                        "test_code": test_code.upper(),
+                        "test_name": str(test_name).strip() if test_name else test_code,
+                        "value": float(value),
+                        "unit": str(unit_value).strip() if unit_value else "",
+                    }
+                    lab_values.append(lab_entry)
+                except (ValueError, TypeError):
+                    # Skip invalid numeric values
+                    pass
         else:
             prepared[key] = value
+    
+    # Add lab_values to prepared dict if any were found
+    if lab_values:
+        prepared["lab_values"] = lab_values
     
     return prepared
 

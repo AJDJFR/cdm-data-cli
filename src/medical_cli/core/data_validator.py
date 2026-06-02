@@ -53,6 +53,24 @@ class LabValue(BaseModel):
             raise ValueError("Laboratory value must be a finite number")
         return v
     
+    @field_validator("test_code", mode="before")
+    @classmethod
+    def normalize_test_code(cls, v: str) -> str:
+        """Normalize test code to uppercase."""
+        if isinstance(v, str):
+            return v.upper().strip()
+        return v
+    
+    @model_validator(mode="after")
+    def auto_populate_reference_ranges(self) -> "LabValue":
+        """Auto-populate reference ranges from LAB_TEST_REFERENCE_RANGES if not provided."""
+        # Only auto-populate if test_code exists and reference ranges are not set
+        if self.test_code in LAB_TEST_REFERENCE_RANGES and self.reference_range_low is None:
+            ref_low, ref_high, _ = LAB_TEST_REFERENCE_RANGES[self.test_code]
+            self.reference_range_low = ref_low
+            self.reference_range_high = ref_high
+        return self
+    
     @model_validator(mode="after")
     def check_abnormal_status(self) -> "LabValue":
         """Automatically determine abnormal status based on reference ranges."""
