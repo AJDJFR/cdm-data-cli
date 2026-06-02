@@ -9,6 +9,7 @@ Key Features:
 - Wide-to-long transformation for clinical data validation
 """
 
+import math
 import re
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -625,8 +626,16 @@ class EDCWideAdapter:
         if val is None:
             return None
         
+        # Handle empty string
+        if val == '' or (isinstance(val, str) and not val.strip()):
+            return None
+        
         try:
-            return float(val)
+            float_val = float(val)
+            # Check for NaN and infinity
+            if not math.isfinite(float_val):
+                return None
+            return float_val
         except (ValueError, TypeError):
             return None
     

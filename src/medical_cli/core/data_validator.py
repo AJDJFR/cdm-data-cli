@@ -4,6 +4,7 @@ This module provides comprehensive validation for clinical trial subject data,
 including subject identifiers, demographic information, and laboratory values.
 """
 
+import math
 import re
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
@@ -73,10 +74,19 @@ class LabValue(BaseModel):
     
     @model_validator(mode="after")
     def check_abnormal_status(self) -> "LabValue":
-        """Automatically determine abnormal status based on reference ranges."""
-        if self.reference_range_low is not None and self.value < self.reference_range_low:
+        """Automatically determine abnormal status based on reference ranges.
+        
+        Defensive check: Only perform comparison if value is not None or NaN.
+        """
+        # Skip comparison if value is None, NaN, or cannot be compared
+        if self.value is None:
+            return self
+        if isinstance(self.value, float) and not math.isfinite(self.value):
+            return self
+        
+        if self.reference_range_low is not None and self.reference_range_low and self.value < self.reference_range_low:
             self.is_abnormal = True
-        elif self.reference_range_high is not None and self.value > self.reference_range_high:
+        elif self.reference_range_high is not None and self.reference_range_high and self.value > self.reference_range_high:
             self.is_abnormal = True
         return self
 
