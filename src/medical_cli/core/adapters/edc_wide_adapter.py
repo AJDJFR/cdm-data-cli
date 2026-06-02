@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
+from pandas.errors import ParserError
 
 from medical_cli.utils.logger import get_logger
 
@@ -404,8 +405,12 @@ class EDCWideAdapter:
     def _read_csv_with_encoding_fallback(self, file_path: Path, **kwargs) -> pd.DataFrame:
         """Read CSV with automatic encoding fallback for Windows compatibility.
         
-        Tries encodings in order: utf-8 → gbk → gb18030
-        Ensures Windows-exported CSV files with Chinese content are readable.
+        Tries encodings in order: utf-8 → gbk → gb18030 → latin1
+        
+        Applies robust CSV parsing:
+        - Uses Python engine for better error tolerance
+        - Skips malformed lines to prevent buffer overflow
+        - Handles encoding errors with fallback mechanism
         
         Args:
             file_path: Path to the CSV file.
@@ -416,21 +421,35 @@ class EDCWideAdapter:
         """
         encodings_to_try = ['utf-8', 'gbk', 'gb18030', 'latin1']
         
+        # Default CSV parsing options - use Python engine for robustness
+        csv_options = {
+            'engine': 'python',      # Use Python engine (C engine throws buffer overflow)
+            'on_bad_lines': 'skip',  # Skip malformed rows instead of crashing
+            'encoding_errors': 'replace',  # Replace unmappable characters
+        }
+        csv_options.update(kwargs)  # Allow caller to override defaults
+        
         for encoding in encodings_to_try:
             try:
-                df = pd.read_csv(file_path, encoding=encoding, **kwargs)
+                df = pd.read_csv(file_path, encoding=encoding, **csv_options)
                 logger.info(f"Successfully read CSV with encoding: {encoding}")
                 return df
-            except UnicodeDecodeError as e:
+            except (UnicodeDecodeError, ParserError) as e:
                 logger.warning(f"Failed to read with encoding '{encoding}': {e}")
                 continue
             except Exception as e:
                 logger.warning(f"Unexpected error with encoding '{encoding}': {e}")
                 continue
         
-        # Last resort: try with errors='replace'
-        logger.warning("All encoding attempts failed, trying errors='replace'")
-        return pd.read_csv(file_path, encoding='utf-8', errors='replace', **kwargs)
+        # Last resort: force Python engine with maximum error tolerance
+        logger.warning("All encoding attempts failed, using last resort options")
+        last_resort_options = {
+            'engine': 'python',
+            'on_bad_lines': 'skip',
+            'encoding_errors': 'replace',
+        }
+        last_resort_options.update(kwargs)
+        return pd.read_csv(file_path, encoding='utf-8', **last_resort_options)
     
     def _build_fuzzy_column_mapping(self) -> Dict[str, Dict[str, str]]:
         """Build fuzzy column mapping using semantic matching.
