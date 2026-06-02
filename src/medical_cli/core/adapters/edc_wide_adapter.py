@@ -135,19 +135,20 @@ class EDCWideAdapter:
     def __init__(
         self,
         file_path: str,
-        header_row_index: Optional[int] = None,  # Auto-detect if not specified
-        data_start_row: int = 7,     # Data starts from Row 8 (0-indexed) if not auto-detected
+        header_row_index: int = 3,  # Row 4 in Excel (1-based) = pandas index 3
+        data_start_row: int = 7,     # Row 8 in Excel (1-based) = pandas index 7
     ) -> None:
         """Initialize the EDC Wide Adapter.
         
         Args:
             file_path: Path to the input file.
-            header_row_index: Row index (0-based) containing business column names.
-                             If None, will auto-detect the row with Subject_ID column.
-            data_start_row: Row index (0-based) where actual data begins (used if header_row_index is None).
+            header_row_index: Row index (0-based in pandas) containing business column names.
+                              Default: 3 (Row 4 in Excel 1-based numbering).
+            data_start_row: Row index (0-based in pandas) where actual data begins.
+                           Default: 7 (Row 8 in Excel 1-based numbering).
         """
         self.file_path = Path(file_path)
-        self._header_row_index = header_row_index  # Will be set during parsing
+        self._header_row_index = header_row_index
         self.data_start_row = data_start_row
         self.mapping = CHINESE_TO_TEST_CODE_MAPPING.copy()
         self.dataframe: Optional[pd.DataFrame] = None
@@ -195,126 +196,54 @@ class EDCWideAdapter:
             raise
     
     def _read_excel(self) -> pd.DataFrame:
-        """Read Excel file with multi-row headers.
-        
-        Auto-detects the header row if not specified.
+        """Read Excel file with fixed header row (Row 4 = index 3).
         
         Returns:
             DataFrame with business column names as headers.
         """
-        logger.info("Reading Excel file with multi-row headers")
+        logger.info(f"Reading Excel file with header at row index {self._header_row_index}")
         
-        # Read raw Excel first to detect header row
-        df_raw = pd.read_excel(self.file_path, header=None)
+        # Read Excel with fixed header row index (3 = Row 4 in Excel 1-based)
+        df = pd.read_excel(self.file_path, header=self._header_row_index)
         
-        # Auto-detect header row if not specified
-        if self._header_row_index is None:
-            self._header_row_index = self._detect_header_row(df_raw)
+        # Skip header row to get to data rows
+        df = df.iloc[self._header_row_index + 1:]
         
-        header_row = self._header_row_index
-        logger.info(f"Using header row index: {header_row}")
-        
-        # Read with specified header
-        df = pd.read_excel(self.file_path, header=header_row)
-        
-        # Clean up column names (remove NaN or unnamed columns)
+        # Clean up column names
         df.columns = [str(col).strip() if pd.notna(col) else f"col_{i}" 
                       for i, col in enumerate(df.columns)]
         
         # Drop columns that are entirely empty or unnamed metadata columns
         df = df.loc[:, ~df.columns.str.match(r"^(col_\d+|Unnamed:\s*\d+)$")]
         
-        # Skip to data rows (after header)
-        data_start = header_row + 1
-        df = df.iloc[data_start - header_row if data_start > header_row else 0:]
+        # Drop rows that are all NaN
         df = df.dropna(how='all')
         
         logger.info(f"Read {len(df)} data rows, columns: {list(df.columns)}")
         return df
     
-    def _detect_header_row(self, df_raw: pd.DataFrame) -> int:
-        """Auto-detect the header row containing business column names.
-        
-        Looks for a row that contains multiple lab test column names
-        (not just a subject ID pattern in metadata rows).
-        
-        Args:
-            df_raw: Raw DataFrame without headers.
-            
-        Returns:
-            Index of the detected header row.
-        """
-        # Lab test name patterns to look for in actual header rows
-        lab_patterns = [
-            "血常规_", "肝功能_", "肾功能_", "血糖_", "血脂_", 
-            "心肌标志物_", "凝血功能_", "WBC", "RBC", "HGB", "K", 
-            "ALT", "AST", "CRE", "BUN"
-        ]
-        
-        subject_patterns = [
-            "患者研究编号", "Subject_ID", "SubjectID", "subject_id",
-            "受试者编号", "SUBJID", "Subject_ID", "受试者ID"
-        ]
-        
-        best_row_idx = 0
-        best_row_score = 0
-        
-        for row_idx, row in df_raw.iterrows():
-            non_null_values = [v for v in row.values if pd.notna(v) and str(v).strip()]
-            num_values = len(non_null_values)
-            
-            # Skip rows with very few values (metadata rows)
-            if num_values < 5:
-                continue
-            
-            row_str = " ".join([str(v) for v in non_null_values])
-            
-            # Score based on lab test patterns found
-            score = 0
-            for pattern in lab_patterns:
-                if pattern in row_str:
-                    score += 1
-            
-            # Bonus for subject ID patterns
-            for pattern in subject_patterns:
-                if pattern in row_str:
-                    score += 0.5
-            
-            if score > best_row_score:
-                best_row_score = score
-                best_row_idx = row_idx
-        
-        # Only use if we found meaningful lab patterns
-        if best_row_score >= 1:
-            logger.info(f"Detected header row at index {best_row_idx} (score: {best_row_score})")
-            return int(best_row_idx)
-        
-        # Default to row 7 (index) if not detected
-        default_row = min(7, len(df_raw) - 1)
-        logger.warning(f"Could not auto-detect header row, using default: {default_row}")
-        return default_row
-    
     def _read_csv(self) -> pd.DataFrame:
-        """Read CSV file with multi-row headers.
+        """Read CSV file with fixed header row (Row 4 = index 3).
         
         Returns:
             DataFrame with business column names as headers.
         """
-        logger.info("Reading CSV file with multi-row headers")
+        logger.info(f"Reading CSV file with header at row index {self._header_row_index}")
         
-        df = pd.read_csv(
-            self.file_path,
-            header=self.header_row_index,
-            skiprows=lambda x: x > 0 and x <= self.header_row_index
-        )
+        # Read CSV with fixed header row index (3 = Row 4 in 1-based numbering)
+        df = pd.read_csv(self.file_path, header=self._header_row_index, encoding='utf-8')
+        
+        # Skip header row to get to data rows
+        df = df.iloc[self._header_row_index + 1:]
         
         # Clean up column names
         df.columns = [str(col).strip() if pd.notna(col) else f"col_{i}" 
                       for i, col in enumerate(df.columns)]
         
         df = df.loc[:, ~df.columns.str.match(r"^(col_\d+|Unnamed:\s*\d+)$")]
+        df = df.dropna(how='all')
         
-        logger.info(f"Read {len(df)} rows, columns: {list(df.columns)}")
+        logger.info(f"Read {len(df)} data rows, columns: {list(df.columns)}")
         return df
     
     def _melt_wide_to_long(self) -> List[Dict[str, Any]]:
