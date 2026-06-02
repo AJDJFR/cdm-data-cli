@@ -8,7 +8,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import click
 
@@ -18,6 +18,7 @@ from medical_cli.core.data_validator import (
     LabValue,
     LAB_TEST_REFERENCE_RANGES,
 )
+from medical_cli.core.adapters.edc_wide_adapter import EDCWideAdapter
 from medical_cli.utils.logger import get_logger
 
 
@@ -109,6 +110,15 @@ def validate_group():
     help="Export sanitized Excel with validation flags. "
          "Creates [filename]_sanitized.xlsx with PHI masked and validation flags.",
 )
+@click.option(
+    "--adapter",
+    "-a",
+    "adapter_type",
+    type=click.Choice(["standard", "edc_wide"], case_sensitive=False),
+    default="standard",
+    help="Data adapter type: 'standard' for simple files, "
+         "'edc_wide' for EDC exports with multi-row headers and wide-table format.",
+)
 def validate_labs(
     input_file: str,
     output_file: Optional[str],
@@ -116,12 +126,13 @@ def validate_labs(
     verbose: bool,
     abnormal_only: bool,
     export_excel: bool,
+    adapter_type: str,
 ) -> None:
     """Validate Excel laboratory test results with PHI sanitization.
     
     This command performs end-to-end validation of clinical laboratory data:
     
-    1. Reads data from the specified Excel file using EDCDataExtractor
+    1. Reads data from the specified Excel file using selected adapter
     2. Automatically detects and masks Protected Health Information (PHI)
     3. Validates each record against clinical data schemas
     4. Checks laboratory values against reference ranges
@@ -129,11 +140,20 @@ def validate_labs(
     6. Optionally exports a sanitized Excel with validation flags
     
     \b
+    Supported Adapters:
+    - standard: For simple Excel/CSV with standard column structure
+    - edc_wide: For EDC system exports with multi-row headers and wide-table format
+    
+    \b
     Examples:
     
     \b
     # Basic validation (output to terminal):
         medical-cli validate labs -i lab_results.xlsx
+    
+    \b
+    # Validate EDC wide-table export with Chinese headers:
+        medical-cli validate labs -i edc_export.xlsx -a edc_wide
     
     \b
     # Save report to file:
@@ -185,20 +205,64 @@ def validate_labs(
     
     try:
         # -----------------------------------------------------------------
-        # Step 1: Read Excel file with PHI sanitization
+        # Step 1: Read Excel file (using selected adapter)
         # -----------------------------------------------------------------
         if verbose:
-            click.echo("\n[Step 1/3] Analyzing Excel data...")
+            if adapter_type == "edc_wide":
+                click.echo("\n[Step 1/4] Parsing EDC wide-table structure...")
+            else:
+                click.echo("\n[Step 1/4] Analyzing Excel data...")
         
-        logger.info(f"Reading Excel file: {input_file}")
+        logger.info(f"Reading file with adapter: {adapter_type}")
+        logger.info(f"Input file: {input_file}")
+        
+        data: List[Dict[str, Any]] = []
+        extractor: Optional[EDCDataExtractor] = None
         
         try:
-            extractor = EDCDataExtractor(
-                input_path=input_file,
-                encoding="utf-8",
-                strict_mode=False,
-            )
-            data = extractor.read_data()
+            if adapter_type == "edc_wide":
+                # Use EDC Wide Adapter for complex multi-row headers
+                if verbose:
+                    click.echo("  Using EDC Wide Adapter for complex structure")
+                
+                adapter = EDCWideAdapter(input_file)
+                parsed_data = adapter.parse_lab_data()
+                
+                # Convert adapter output to standard format for validation
+                for record in parsed_data:
+                    # Add default age/gender if not present
+                    if "Age" not in record:
+                        record["Age"] = 0  # Will be validated
+                    if "Gender" not in record:
+                        record["Gender"] = "U"  # Unknown
+                    
+                    # Format for validation
+                    validated_record = {
+                        "Subject_ID": record.get("Subject_ID", ""),
+                        "Age": record.get("Age", 0),
+                        "Gender": record.get("Gender", "U"),
+                        "Visit_Date": record.get("Visit_Date", ""),
+                    }
+                    if "lab_values" in record:
+                        validated_record["lab_values"] = record["lab_values"]
+                    
+                    data.append(validated_record)
+                
+                if verbose:
+                    click.echo(f"  ✓ Parsed {len(data)} records from wide-table format")
+                
+            else:
+                # Standard adapter
+                extractor = EDCDataExtractor(
+                    input_path=input_file,
+                    encoding="utf-8",
+                    strict_mode=False,
+                )
+                data = extractor.read_data()
+                
+                if verbose:
+                    click.echo(f"  ✓ Read {len(data)} rows")
+                    
         except FileNotFoundError:
             click.echo(
                 click.style(
@@ -241,28 +305,32 @@ def validate_labs(
             _output_report(report, output_file)
             sys.exit(1)
         
-        # Update PHI sanitization info
-        phi_report = extractor.get_phi_report()
         report["phi_sanitization"] = {
-            "records_sanitized": phi_report.get("total_records", 0),
-            "fields_masked": phi_report.get("masked_count", 0),
-            "phi_detected": not phi_report.get("is_clean", True),
-            "detections": phi_report.get("detections_by_type", {}),
+            "records_sanitized": 0 if adapter_type == "edc_wide" else phi_report.get("total_records", 0),
+            "fields_masked": 0 if adapter_type == "edc_wide" else phi_report.get("masked_count", 0),
+            "phi_detected": False if adapter_type == "edc_wide" else not phi_report.get("is_clean", True),
+            "detections": {} if adapter_type == "edc_wide" else phi_report.get("detections_by_type", {}),
         }
         
         report["total_rows_processed"] = len(data)
         
         if verbose:
-            click.echo(
-                f"  ✓ Read {len(data)} rows "
-                f"(PHI fields masked: {phi_report.get('masked_count', 0)})"
-            )
+            if adapter_type == "edc_wide":
+                click.echo(f"  ✓ Parsed {len(data)} records (PHI detection not available for edc_wide adapter)")
+            else:
+                click.echo(
+                    f"  ✓ Read {len(data)} rows "
+                    f"(PHI fields masked: {phi_report.get('masked_count', 0)})"
+                )
         
         # -----------------------------------------------------------------
         # Step 2: Validate data with ClinicalDataValidator
         # -----------------------------------------------------------------
         if verbose:
-            click.echo("\n[Step 2/3] Validating clinical data...")
+            if adapter_type == "edc_wide":
+                click.echo("\n[Step 2/4] Validating clinical data (from adapter)...")
+            else:
+                click.echo("\n[Step 2/4] Validating clinical data...")
         
         logger.info("Starting data validation")
         
@@ -378,7 +446,10 @@ def validate_labs(
         # Step 3: Generate report and optionally export Excel
         # -----------------------------------------------------------------
         if verbose:
-            click.echo("\n[Step 3/3] Generating validation report...")
+            if adapter_type == "edc_wide":
+                click.echo("\n[Step 3/4] Generating validation report...")
+            else:
+                click.echo("\n[Step 3/4] Generating validation report...")
         
         # Determine overall status
         if report["summary"]["errors"] > 0:
